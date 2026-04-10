@@ -2,7 +2,6 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
 import pandas as pd
-from sqlalchemy import create_engine, text
 
 default_args = {
     'owner': 'airflow',
@@ -26,10 +25,14 @@ def task_extract_spotify(**context):
 
 # ── TASK 2: Extract Grammys ────────────────────────────────
 def task_extract_grammys(**context):
-    engine = create_engine(
-        "mysql+pymysql://etl_user:etl1234@mysql:3306/grammys_db"
+    import pymysql
+    conn = pymysql.connect(
+        host="mysql", port=3306,
+        user="etl_user", password="etl1234",
+        database="grammys_db"
     )
-    df = pd.read_sql("SELECT * FROM grammy_awards", con=engine)
+    df = pd.read_sql("SELECT * FROM grammy_awards", con=conn)
+    conn.close()
     df.to_csv("/opt/airflow/data/raw_grammys.csv", index=False)
     print(f"✅ Grammys extracted: {df.shape}")
 
@@ -79,122 +82,104 @@ def task_merge(**context):
     merged.to_csv("/opt/airflow/data/merged_dataset.csv", index=False)
     print(f"✅ Merged: {merged.shape}")
 
-# ── TASK 6: Load to Google Drive ───────────────────────────
+# ── TASK 6: Store CSV ──────────────────────────────────────
 def task_store_gdrive(**context):
-    # For now we store locally — GDrive integration in next step
-    import shutil
-    shutil.copy(
-        "/opt/airflow/data/merged_dataset.csv",
-        "/opt/airflow/data/merged_dataset_gdrive_ready.csv"
-    )
+    import os
+    src = "/opt/airflow/data/merged_dataset.csv"
+    dst = "/opt/airflow/data/merged_dataset_gdrive_ready.csv"
+    if os.path.exists(dst):
+        os.remove(dst)
+    with open(src, 'r') as f_in, open(dst, 'w') as f_out:
+        f_out.write(f_in.read())
     print("✅ File ready for Google Drive upload")
 
 # ── TASK 7: Load to Data Warehouse ────────────────────────
 def task_load_dw(**context):
+    import pymysql
     df = pd.read_csv("/opt/airflow/data/merged_dataset.csv")
-    engine = create_engine(
-        "mysql+pymysql://etl_user:etl1234@mysql:3306/grammys_db"
+
+    conn = pymysql.connect(
+        host="mysql", port=3306,
+        user="etl_user", password="etl1234",
+        database="grammys_db"
     )
-    with engine.connect() as conn:
-        # Truncate fact table to avoid duplicates on re-runs
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
-        conn.execute(text("TRUNCATE TABLE fact_grammy_spotify"))
-        conn.execute(text("TRUNCATE TABLE dim_artist"))
-        conn.execute(text("TRUNCATE TABLE dim_song"))
-        conn.execute(text("TRUNCATE TABLE dim_grammy_category"))
-        conn.execute(text("TRUNCATE TABLE dim_date"))
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
-        conn.commit()
+    cursor = conn.cursor()
 
-        # dim_date
-        for year in df['grammy_year'].dropna().unique():
-            conn.execute(text(
-                "INSERT IGNORE INTO dim_date (date_id, year) VALUES (:d, :y)"
-            ), {"d": int(year), "y": int(year)})
-        conn.commit()
+    cursor.execute("SET FOREIGN_KEY_CHECKS=0")
+    cursor.execute("TRUNCATE TABLE fact_grammy_spotify")
+    cursor.execute("TRUNCATE TABLE dim_artist")
+    cursor.execute("TRUNCATE TABLE dim_song")
+    cursor.execute("TRUNCATE TABLE dim_grammy_category")
+    cursor.execute("TRUNCATE TABLE dim_date")
+    cursor.execute("SET FOREIGN_KEY_CHECKS=1")
+    conn.commit()
 
-        # dim_artist
-        for artist in df['artist'].dropna().unique():
-            conn.execute(text(
-                "INSERT IGNORE INTO dim_artist (artist_name) VALUES (:n)"
-            ), {"n": str(artist)[:500]})
-        conn.commit()
+    for year in df['grammy_year'].dropna().unique():
+        cursor.execute("INSERT IGNORE INTO dim_date (date_id, year) VALUES (%s, %s)", (int(year), int(year)))
+    conn.commit()
 
-        # dim_grammy_category
-        for cat in df['grammy_category'].dropna().unique():
-            conn.execute(text(
-                "INSERT IGNORE INTO dim_grammy_category (category_name) VALUES (:n)"
-            ), {"n": str(cat)[:300]})
-        conn.commit()
+    for artist in df['artist'].dropna().unique():
+        cursor.execute("INSERT IGNORE INTO dim_artist (artist_name) VALUES (%s)", (str(artist)[:500],))
+    conn.commit()
 
-        # dim_song
-        songs = df[df['track_id'].notna()][
-            ['track_id','song_name','album','track_genre','duration_sec','explicit']
-        ].drop_duplicates(subset=['track_id'])
-        for _, row in songs.iterrows():
-            conn.execute(text("""
-                INSERT IGNORE INTO dim_song
-                    (track_id, song_name, album, track_genre, duration_sec, explicit)
-                VALUES (:tid, :sn, :al, :tg, :ds, :ex)
-            """), {
-                "tid": str(row['track_id'])[:100],
-                "sn":  str(row['song_name'])[:500],
-                "al":  str(row['album'])[:500],
-                "tg":  str(row['track_genre'])[:100],
-                "ds":  float(row['duration_sec']),
-                "ex":  bool(row['explicit'])
-            })
-        conn.commit()
+    for cat in df['grammy_category'].dropna().unique():
+        cursor.execute("INSERT IGNORE INTO dim_grammy_category (category_name) VALUES (%s)", (str(cat)[:300],))
+    conn.commit()
 
-        # fact table
-        inserted = 0
-        for _, row in df.iterrows():
-            a = conn.execute(text(
-                "SELECT artist_id FROM dim_artist WHERE artist_name=:n"
-            ), {"n": str(row['artist'])[:500]}).fetchone()
-            c = conn.execute(text(
-                "SELECT category_id FROM dim_grammy_category WHERE category_name=:n"
-            ), {"n": str(row['grammy_category'])[:300]}).fetchone()
-            s = None
-            if pd.notna(row.get('track_id')):
-                s = conn.execute(text(
-                    "SELECT song_id FROM dim_song WHERE track_id=:t"
-                ), {"t": str(row['track_id'])[:100]}).fetchone()
-            conn.execute(text("""
-                INSERT INTO fact_grammy_spotify (
-                    artist_id, song_id, category_id, date_id,
-                    grammy_nominee, grammy_winner, found_in_spotify,
-                    popularity, danceability, energy, loudness,
-                    tempo, valence, speechiness, acousticness,
-                    instrumentalness, liveness
-                ) VALUES (
-                    :a, :s, :c, :d, :gn, :gw, :fs,
-                    :pop, :dan, :en, :lou, :tem, :val,
-                    :spe, :aco, :ins, :liv
-                )
-            """), {
-                "a":   a[0] if a else None,
-                "s":   s[0] if s else None,
-                "c":   c[0] if c else None,
-                "d":   int(row['grammy_year']) if pd.notna(row['grammy_year']) else None,
-                "gn":  str(row['grammy_nominee'])[:500] if pd.notna(row.get('grammy_nominee')) else None,
-                "gw":  bool(row['grammy_winner']),
-                "fs":  bool(row['found_in_spotify']),
-                "pop": float(row['popularity']) if pd.notna(row.get('popularity')) else None,
-                "dan": float(row['danceability']) if pd.notna(row.get('danceability')) else None,
-                "en":  float(row['energy']) if pd.notna(row.get('energy')) else None,
-                "lou": float(row['loudness']) if pd.notna(row.get('loudness')) else None,
-                "tem": float(row['tempo']) if pd.notna(row.get('tempo')) else None,
-                "val": float(row['valence']) if pd.notna(row.get('valence')) else None,
-                "spe": float(row['speechiness']) if pd.notna(row.get('speechiness')) else None,
-                "aco": float(row['acousticness']) if pd.notna(row.get('acousticness')) else None,
-                "ins": float(row['instrumentalness']) if pd.notna(row.get('instrumentalness')) else None,
-                "liv": float(row['liveness']) if pd.notna(row.get('liveness')) else None,
-            })
-            inserted += 1
-            if inserted % 1000 == 0:
-                conn.commit()
-        conn.commit()
+    songs = df[df['track_id'].notna()][
+        ['track_id','song_name','album','track_genre','duration_sec','explicit']
+    ].drop_duplicates(subset=['track_id'])
+    for _, row in songs.iterrows():
+        cursor.execute("""
+            INSERT IGNORE INTO dim_song (track_id, song_name, album, track_genre, duration_sec, explicit)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (str(row['track_id'])[:100], str(row['song_name'])[:500],
+              str(row['album'])[:500], str(row['track_genre'])[:100],
+              float(row['duration_sec']), bool(row['explicit'])))
+    conn.commit()
+
+    inserted = 0
+    for _, row in df.iterrows():
+        cursor.execute("SELECT artist_id FROM dim_artist WHERE artist_name=%s", (str(row['artist'])[:500],))
+        a = cursor.fetchone()
+        cursor.execute("SELECT category_id FROM dim_grammy_category WHERE category_name=%s", (str(row['grammy_category'])[:300],))
+        c = cursor.fetchone()
+        s = None
+        if pd.notna(row.get('track_id')):
+            cursor.execute("SELECT song_id FROM dim_song WHERE track_id=%s", (str(row['track_id'])[:100],))
+            s = cursor.fetchone()
+        cursor.execute("""
+            INSERT INTO fact_grammy_spotify (
+                artist_id, song_id, category_id, date_id,
+                grammy_nominee, grammy_winner, found_in_spotify,
+                popularity, danceability, energy, loudness,
+                tempo, valence, speechiness, acousticness,
+                instrumentalness, liveness
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            a[0] if a else None, s[0] if s else None,
+            c[0] if c else None,
+            int(row['grammy_year']) if pd.notna(row['grammy_year']) else None,
+            str(row['grammy_nominee'])[:500] if pd.notna(row.get('grammy_nominee')) else None,
+            bool(row['grammy_winner']), bool(row['found_in_spotify']),
+            float(row['popularity']) if pd.notna(row.get('popularity')) else None,
+            float(row['danceability']) if pd.notna(row.get('danceability')) else None,
+            float(row['energy']) if pd.notna(row.get('energy')) else None,
+            float(row['loudness']) if pd.notna(row.get('loudness')) else None,
+            float(row['tempo']) if pd.notna(row.get('tempo')) else None,
+            float(row['valence']) if pd.notna(row.get('valence')) else None,
+            float(row['speechiness']) if pd.notna(row.get('speechiness')) else None,
+            float(row['acousticness']) if pd.notna(row.get('acousticness')) else None,
+            float(row['instrumentalness']) if pd.notna(row.get('instrumentalness')) else None,
+            float(row['liveness']) if pd.notna(row.get('liveness')) else None,
+        ))
+        inserted += 1
+        if inserted % 1000 == 0:
+            conn.commit()
+
+    conn.commit()
+    cursor.close()
+    conn.close()
     print(f"✅ DW loaded: {inserted} rows")
 
 # ── DEFINE TASKS ───────────────────────────────────────────
